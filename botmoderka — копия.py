@@ -25,7 +25,7 @@ class BotConfig:
     MAIN_GROUP_ID: int = -1002985913442
     MAIN_GROUP_THREAD_ID: int = 17
     MODERATORS: set[int] = {7741825772, 5141491311}
-    ADMIN_IDS: set[int] = {7741825772, 5141491311}  # Администраторы с доступом к /adminpanel
+    ADMIN_IDS: set[int] = {7741825772, 5141491311}
     
     # Ограничения
     MAX_PHOTO_SIZE_MB: int = 10
@@ -35,7 +35,7 @@ class BotConfig:
     
     # Настройки админ-панели
     CONFIG_FILE: str = 'bot_config.json'
-    MAX_COMMENT_LENGTH: int = 1000  # Максимальная длина комментария модератора
+    MAX_COMMENT_LENGTH: int = 1000
     
     @classmethod
     def load_config(cls):
@@ -70,7 +70,6 @@ class BotConfig:
         except Exception as e:
             logging.error(f"Ошибка сохранения конфигурации: {e}")
 
-# Загружаем конфигурацию при старте
 BotConfig.load_config()
 
 # ================== МОДЕЛИ ДАННЫХ ==================
@@ -96,8 +95,8 @@ class PendingPost:
             self.timestamp = datetime.now()
 
 # ================== СОСТОЯНИЯ FSM ==================
-class ModerationStates(StatesGroup):
-    """Состояния для модерации с комментариями"""
+class CommentStates(StatesGroup):
+    """Состояния для комментариев"""
     waiting_for_approve_comment = State()
     waiting_for_reject_comment = State()
 
@@ -118,14 +117,13 @@ class PostManager:
     def __init__(self):
         self._pending_posts: Dict[int, PendingPost] = {}
         self._lock = asyncio.Lock()
-        self._user_stats: Dict[int, Dict[str, int]] = {}  # Статистика по пользователям
+        self._user_stats: Dict[int, Dict[str, int]] = {}
     
     async def add_post(self, user_id: int, username: Optional[str], 
                       original_msg_id: int, mod_msg_id: int,
                       content_type: ContentType, file_id: str, caption: Optional[str] = None) -> bool:
         """Добавить пост в очередь на модерацию"""
         async with self._lock:
-            # Очистка старых постов при превышении лимита
             if len(self._pending_posts) >= BotConfig.MAX_PENDING_POSTS:
                 await self._cleanup_old_posts()
             
@@ -141,7 +139,6 @@ class PostManager:
             
             self._pending_posts[original_msg_id] = post
             
-            # Обновляем статистику
             if user_id not in self._user_stats:
                 self._user_stats[user_id] = {'submitted': 0, 'approved': 0, 'rejected': 0}
             self._user_stats[user_id]['submitted'] += 1
@@ -157,7 +154,6 @@ class PostManager:
         """Пометить пост как одобренный"""
         if post := self._pending_posts.get(post_id):
             post.is_processed = True
-            # Обновляем статистику
             if post.user_id in self._user_stats:
                 self._user_stats[post.user_id]['approved'] += 1
     
@@ -165,7 +161,6 @@ class PostManager:
         """Пометить пост как отклоненный"""
         if post := self._pending_posts.get(post_id):
             post.is_processed = True
-            # Обновляем статистику
             if post.user_id in self._user_stats:
                 self._user_stats[post.user_id]['rejected'] += 1
     
@@ -273,6 +268,14 @@ class KeyboardFactory:
         builder.button(text="🔙 Назад", callback_data="admin_back")
         builder.adjust(1, 1, 1, 1)
         return builder.as_markup()
+    
+    @staticmethod
+    def get_cancel_kb() -> InlineKeyboardMarkup:
+        """Клавиатура отмены"""
+        builder = InlineKeyboardBuilder()
+        builder.button(text="❌ Отмена", callback_data="cancel_input")
+        builder.adjust(1)
+        return builder.as_markup()
 
 # ================== ВАЛИДАТОРЫ ==================
 class ContentValidator:
@@ -280,19 +283,12 @@ class ContentValidator:
     
     @staticmethod
     def is_allowed_content(message: Message) -> tuple[bool, Optional[str]]:
-        """
-        Проверяет, является ли контент допустимым.
-        Возвращает (is_valid, file_id или None)
-        """
-        # Только фото или видео
         if message.photo:
             return True, message.photo[-1].file_id
         elif message.video:
-            # Проверка размера видео
             if message.video.file_size and message.video.file_size > BotConfig.MAX_VIDEO_SIZE_MB * 1024 * 1024:
                 return False, f"Видео слишком большое (максимум {BotConfig.MAX_VIDEO_SIZE_MB}МБ)"
             return True, message.video.file_id
-        
         return False, None
 
 # ================== ОСНОВНОЙ КОД ==================
@@ -305,20 +301,27 @@ class MemesModerationBot:
         self.dp = Dispatcher(storage=self.storage)
         self.post_manager = PostManager()
         
-        # Регистрация обработчиков
         self._register_handlers()
         
     def _register_handlers(self):
-        """Регистрация всех обработчиков"""
+        """Регистрация всех обработчиков с правильным порядком"""
         # Команды
         self.dp.message.register(self._cmd_start, Command("start"))
         self.dp.message.register(self._cmd_help, Command("help"))
         self.dp.message.register(self._cmd_admin, Command("adminpanel"))
+        self.dp.message.register(self._cmd_cancel, Command("cancel"))
         
-        # Приём контента (только приватные чаты)
+        # Обработка комментариев (ДОЛЖНЫ БЫТЬ ПЕРВЫМИ!)
+        self.dp.message.register(self._handle_approve_comment, CommentStates.waiting_for_approve_comment)
+        self.dp.message.register(self._handle_reject_comment, CommentStates.waiting_for_reject_comment)
+        
+        # Обработка ввода админ-панели (ДОЛЖНЫ БЫТЬ ПЕРВЫМИ!)
+        self.dp.message.register(self._handle_admin_input, StateFilter(AdminStates))
+        
+        # Приём контента (только приватные чаты, когда не в состоянии)
         self.dp.message.register(self._handle_content, 
                                 F.chat.type == 'private',
-                                StateFilter('*'))
+                                StateFilter(None))  # Только когда не в состоянии
         
         # Обработка действий модераторов
         self.dp.callback_query.register(self._approve_post, F.data.startswith("approve_") & ~F.data.contains("comment"))
@@ -326,9 +329,8 @@ class MemesModerationBot:
         self.dp.callback_query.register(self._approve_with_comment_start, F.data.startswith("approve_comment_"))
         self.dp.callback_query.register(self._reject_with_comment_start, F.data.startswith("reject_comment_"))
         
-        # Обработка комментариев
-        self.dp.message.register(self._handle_approve_comment, ModerationStates.waiting_for_approve_comment)
-        self.dp.message.register(self._handle_reject_comment, ModerationStates.waiting_for_reject_comment)
+        # Обработка отмены ввода
+        self.dp.callback_query.register(self._cancel_input, F.data == "cancel_input")
         
         # Вспомогательные колбеки
         self.dp.callback_query.register(self._show_rules, F.data == "show_rules")
@@ -358,13 +360,11 @@ class MemesModerationBot:
         self.dp.callback_query.register(self._add_admin, F.data == "add_admin")
         self.dp.callback_query.register(self._remove_admin, F.data == "remove_admin")
         self.dp.callback_query.register(self._list_admins, F.data == "list_admins")
-        
-        # Обработка ввода в админ-панели
-        self.dp.message.register(self._handle_admin_input, StateFilter(AdminStates))
-
+    
     # ================== КОМАНДЫ ==================
-    async def _cmd_start(self, message: Message):
+    async def _cmd_start(self, message: Message, state: FSMContext):
         """Обработка команды /start"""
+        await state.clear()  # Сбрасываем состояние
         welcome_text = (
             "🚢 <b>Добро пожаловать в предложки Shkiper_online!</b>\n\n"
             "<b>Принимаем только:</b>\n"
@@ -380,8 +380,9 @@ class MemesModerationBot:
             reply_markup=KeyboardFactory.get_user_help_kb()
         )
     
-    async def _cmd_help(self, message: Message):
+    async def _cmd_help(self, message: Message, state: FSMContext):
         """Обработка команды /help"""
+        await state.clear()  # Сбрасываем состояние
         help_text = (
             "📋 <b>Как это работает:</b>\n\n"
             "1. Пришли фото или видео в этот чат\n"
@@ -397,12 +398,13 @@ class MemesModerationBot:
         
         await message.answer(help_text, parse_mode="HTML")
     
-    async def _cmd_admin(self, message: Message):
+    async def _cmd_admin(self, message: Message, state: FSMContext):
         """Секретная команда /adminpanel"""
         if message.from_user.id not in BotConfig.ADMIN_IDS:
             await message.answer("⛔ У вас нет доступа к админ-панели.")
             return
         
+        await state.clear()  # Сбрасываем предыдущие состояния
         admin_text = (
             "⚙️ <b>Админ-панель управления ботом</b>\n\n"
             "Выберите действие:"
@@ -414,6 +416,25 @@ class MemesModerationBot:
             reply_markup=KeyboardFactory.get_admin_panel_kb()
         )
     
+    async def _cmd_cancel(self, message: Message, state: FSMContext):
+        """Команда отмены /cancel"""
+        current_state = await state.get_state()
+        if current_state is None:
+            await message.answer("❌ Нет активного действия для отмены.")
+            return
+        
+        await state.clear()
+        await message.answer("✅ Действие отменено.")
+        
+        # Если это админ, возвращаем в админ-панель
+        if message.from_user.id in BotConfig.ADMIN_IDS:
+            await message.answer(
+                "⚙️ <b>Админ-панель управления ботом</b>\n\n"
+                "Выберите действие:",
+                parse_mode="HTML",
+                reply_markup=KeyboardFactory.get_admin_panel_kb()
+            )
+    
     # ================== ОБРАБОТКА КОНТЕНТА ==================
     async def _handle_content(self, message: Message):
         """Обработка входящего контента от пользователей"""
@@ -421,7 +442,6 @@ class MemesModerationBot:
         if message.text and message.text.startswith('/'):
             return
         
-        # Валидация контента
         is_valid, file_id_or_error = ContentValidator.is_allowed_content(message)
         
         if not is_valid:
@@ -443,15 +463,10 @@ class MemesModerationBot:
             parse_mode="HTML"
         )
         
-        # Подготовка данных для модерации
         try:
-            # Определяем тип контента
             content_type = ContentType.PHOTO if message.photo else ContentType.VIDEO
-            
-            # Формируем сообщение для модераторов
             mod_caption = self._create_moderation_caption(message)
             
-            # Отправляем модераторам
             sent_msg = await self._send_to_moderators(
                 content_type=content_type,
                 file_id=file_id_or_error,
@@ -460,7 +475,6 @@ class MemesModerationBot:
             )
             
             if sent_msg:
-                # Сохраняем в менеджер
                 await self.post_manager.add_post(
                     user_id=message.from_user.id,
                     username=message.from_user.username,
@@ -470,7 +484,6 @@ class MemesModerationBot:
                     file_id=file_id_or_error,
                     caption=message.caption
                 )
-                
                 logging.info(f"Пост {message.message_id} от {message.from_user.id} отправлен модераторам")
             else:
                 await message.reply("⚠️ Произошла ошибка при отправке модераторам. Попробуй позже.")
@@ -511,7 +524,7 @@ class MemesModerationBot:
                     parse_mode="HTML",
                     reply_markup=reply_markup
                 )
-            else:  # ContentType.VIDEO
+            else:
                 return await self.bot.send_video(
                     chat_id=BotConfig.MODERATORS_CHAT_ID,
                     video=file_id,
@@ -525,23 +538,19 @@ class MemesModerationBot:
     
     # ================== МОДЕРАЦИЯ ==================
     async def _check_moderator_permission(self, callback: CallbackQuery) -> bool:
-        """Проверка прав модератора"""
         if callback.from_user.id not in BotConfig.MODERATORS:
             await callback.answer("❌ Ты не модератор!", show_alert=True)
             return False
         return True
     
     async def _update_moderator_message(self, callback: CallbackQuery, post_data: PendingPost, action: str, comment: str = ""):
-        """Обновляет сообщение у модераторов"""
         try:
-            # Удаляем клавиатуру
             await self.bot.edit_message_reply_markup(
                 chat_id=BotConfig.MODERATORS_CHAT_ID,
                 message_id=post_data.moderator_message_id,
                 reply_markup=None
             )
             
-            # Добавляем пометку о действии
             username = html.quote(callback.from_user.username or callback.from_user.first_name or 'модератор')
             
             if action == "approve":
@@ -571,9 +580,7 @@ class MemesModerationBot:
                 logging.warning(f"Не удалось обновить сообщение модерации: {e}")
     
     async def _publish_to_group(self, post_data: PendingPost, comment: str = ""):
-        """Публикует пост в основную группу (без информации о модераторе и анонимности)"""
         try:
-            # Только комментарий, если он есть
             caption = comment if comment else None
             
             if post_data.content_type == ContentType.PHOTO:
@@ -584,7 +591,7 @@ class MemesModerationBot:
                     caption=caption,
                     parse_mode="HTML" if caption else None
                 )
-            else:  # ContentType.VIDEO
+            else:
                 await self.bot.send_video(
                     chat_id=BotConfig.MAIN_GROUP_ID,
                     message_thread_id=BotConfig.MAIN_GROUP_THREAD_ID,
@@ -599,7 +606,6 @@ class MemesModerationBot:
             return False
     
     async def _notify_user_rejection(self, post_data: PendingPost, comment: str = ""):
-        """Уведомляет пользователя об отклонении его предложки"""
         try:
             comment_text = f"\n\n<b>Комментарий модератора:</b>\n{comment}" if comment else ""
             
@@ -618,7 +624,6 @@ class MemesModerationBot:
             return False
     
     async def _approve_post(self, callback: CallbackQuery):
-        """Обработка одобрения поста без комментария"""
         if not await self._check_moderator_permission(callback):
             return
         
@@ -626,13 +631,10 @@ class MemesModerationBot:
         post_data = await self.post_manager.get_post(post_id)
         
         if not post_data or post_data.is_processed:
-            await callback.answer("Предложка уже обработана или устарела.")
+            await callback.answer("Предожка уже обработана или устарела.")
             return
         
-        # Обновляем сообщение у модераторов
         await self._update_moderator_message(callback, post_data, "approve")
-        
-        # Публикуем в группе (без комментария)
         success = await self._publish_to_group(post_data)
         
         if success:
@@ -641,11 +643,9 @@ class MemesModerationBot:
         else:
             await callback.answer("⚠️ Ошибка при публикации в группу.", show_alert=True)
         
-        # Помечаем как одобренный
         await self.post_manager.mark_approved(post_id)
     
     async def _reject_post(self, callback: CallbackQuery):
-        """Обработка отклонения поста без комментария"""
         if not await self._check_moderator_permission(callback):
             return
         
@@ -656,10 +656,7 @@ class MemesModerationBot:
             await callback.answer("Предожка уже обработана.")
             return
         
-        # Обновляем сообщение у модераторов
         await self._update_moderator_message(callback, post_data, "reject")
-        
-        # Уведомляем пользователя
         user_notified = await self._notify_user_rejection(post_data)
         
         if user_notified:
@@ -667,13 +664,10 @@ class MemesModerationBot:
             logging.info(f"Пост {post_id} отклонен {callback.from_user.id}")
         else:
             await callback.answer("❌ Предожка отклонена. Не удалось уведомить пользователя.", show_alert=True)
-            logging.warning(f"Пост {post_id} отклонен {callback.from_user.id}, но пользователь НЕ уведомлен")
         
-        # Помечаем как отклоненный
         await self.post_manager.mark_rejected(post_id)
     
     async def _approve_with_comment_start(self, callback: CallbackQuery, state: FSMContext):
-        """Начало одобрения с комментарием"""
         if not await self._check_moderator_permission(callback):
             return
         
@@ -684,19 +678,19 @@ class MemesModerationBot:
             await callback.answer("Предожка уже обработана или устарела.")
             return
         
-        # Сохраняем данные в состоянии
-        await state.set_state(ModerationStates.waiting_for_approve_comment)
-        await state.update_data(post_id=post_id, mod_message_id=callback.message.message_id)
+        await state.set_state(CommentStates.waiting_for_approve_comment)
+        await state.update_data(post_id=post_id, moderator_id=callback.from_user.id)
         
         await callback.message.answer(
             "💬 <b>Введите комментарий для публикации:</b>\n\n"
-            "Этот комментарий будет отображен вместе с постом в группе.",
-            parse_mode="HTML"
+            "Этот комментарий будет отображен вместе с постом в группе.\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
     async def _reject_with_comment_start(self, callback: CallbackQuery, state: FSMContext):
-        """Начало отклонения с комментарием"""
         if not await self._check_moderator_permission(callback):
             return
         
@@ -707,21 +701,27 @@ class MemesModerationBot:
             await callback.answer("Предожка уже обработана.")
             return
         
-        # Сохраняем данные в состоянии
-        await state.set_state(ModerationStates.waiting_for_reject_comment)
-        await state.update_data(post_id=post_id, mod_message_id=callback.message.message_id)
+        await state.set_state(CommentStates.waiting_for_reject_comment)
+        await state.update_data(post_id=post_id, moderator_id=callback.from_user.id)
         
         await callback.message.answer(
             "📝 <b>Введите причину отклонения:</b>\n\n"
-            "Этот комментарий будет отправлен пользователю.",
-            parse_mode="HTML"
+            "Этот комментарий будет отправлен пользователю.\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
     async def _handle_approve_comment(self, message: Message, state: FSMContext):
-        """Обработка комментария для одобрения"""
         data = await state.get_data()
         post_id = data.get('post_id')
+        moderator_id = data.get('moderator_id')
+        
+        # Проверяем, что сообщение от того же модератора
+        if message.from_user.id != moderator_id:
+            await message.answer("❌ Это не ваш запрос на комментарий.")
+            return
         
         if not post_id:
             await message.answer("Ошибка: данные поста не найдены.")
@@ -736,16 +736,19 @@ class MemesModerationBot:
         
         comment = message.text[:BotConfig.MAX_COMMENT_LENGTH]
         
-        # Обновляем сообщение у модераторов
-        callback_query = type('obj', (object,), {
-            'from_user': message.from_user,
-            'message': type('obj', (object,), {'caption': None})(),
-            'answer': lambda **kwargs: None
-        })
+        # Создаем fake callback для обновления сообщения
+        class FakeCallback:
+            def __init__(self, user, message_text):
+                self.from_user = user
+                self.message = type('obj', (object,), {'caption': message_text})()
+                self.data = f"approve_{post_id}"
+            
+            async def answer(self, text, show_alert=False):
+                pass
         
-        await self._update_moderator_message(callback_query, post_data, "approve", comment)
+        fake_callback = FakeCallback(message.from_user, "")
+        await self._update_moderator_message(fake_callback, post_data, "approve", comment)
         
-        # Публикуем в группе с комментарием
         success = await self._publish_to_group(post_data, comment)
         
         if success:
@@ -754,14 +757,17 @@ class MemesModerationBot:
         else:
             await message.answer("⚠️ Ошибка при публикации в группу.")
         
-        # Помечаем как одобренный
         await self.post_manager.mark_approved(post_id)
         await state.clear()
     
     async def _handle_reject_comment(self, message: Message, state: FSMContext):
-        """Обработка комментария для отклонения"""
         data = await state.get_data()
         post_id = data.get('post_id')
+        moderator_id = data.get('moderator_id')
+        
+        if message.from_user.id != moderator_id:
+            await message.answer("❌ Это не ваш запрос на комментарий.")
+            return
         
         if not post_id:
             await message.answer("Ошибка: данные поста не найдены.")
@@ -776,16 +782,18 @@ class MemesModerationBot:
         
         comment = message.text[:BotConfig.MAX_COMMENT_LENGTH]
         
-        # Обновляем сообщение у модераторов
-        callback_query = type('obj', (object,), {
-            'from_user': message.from_user,
-            'message': type('obj', (object,), {'caption': None})(),
-            'answer': lambda **kwargs: None
-        })
+        class FakeCallback:
+            def __init__(self, user, message_text):
+                self.from_user = user
+                self.message = type('obj', (object,), {'caption': message_text})()
+                self.data = f"reject_{post_id}"
+            
+            async def answer(self, text, show_alert=False):
+                pass
         
-        await self._update_moderator_message(callback_query, post_data, "reject", comment)
+        fake_callback = FakeCallback(message.from_user, "")
+        await self._update_moderator_message(fake_callback, post_data, "reject", comment)
         
-        # Уведомляем пользователя с комментарием
         user_notified = await self._notify_user_rejection(post_data, comment)
         
         if user_notified:
@@ -794,17 +802,24 @@ class MemesModerationBot:
         else:
             await message.answer("❌ Предожка отклонена. Не удалось уведомить пользователя.")
         
-        # Помечаем как отклоненный
         await self.post_manager.mark_rejected(post_id)
         await state.clear()
     
+    async def _cancel_input(self, callback: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ Действие отменено.",
+            reply_markup=None
+        )
+        await callback.answer()
+    
     # ================== АДМИН-ПАНЕЛЬ ==================
-    async def _admin_stats(self, callback: CallbackQuery):
-        """Статистика бота"""
+    async def _admin_stats(self, callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id not in BotConfig.ADMIN_IDS:
             await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
+        await state.clear()
         stats = self.post_manager.get_stats()
         
         stats_text = (
@@ -830,12 +845,12 @@ class MemesModerationBot:
         )
         await callback.answer()
     
-    async def _admin_limits(self, callback: CallbackQuery):
-        """Настройки лимитов"""
+    async def _admin_limits(self, callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id not in BotConfig.ADMIN_IDS:
             await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
+        await state.clear()
         await callback.message.edit_text(
             "⚙️ <b>Настройки лимитов</b>\n\n"
             "Выберите параметр для изменения:",
@@ -844,12 +859,12 @@ class MemesModerationBot:
         )
         await callback.answer()
     
-    async def _admin_moderators(self, callback: CallbackQuery):
-        """Управление модераторами"""
+    async def _admin_moderators(self, callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id not in BotConfig.ADMIN_IDS:
             await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
+        await state.clear()
         await callback.message.edit_text(
             "👥 <b>Управление модераторами</b>\n\n"
             f"Текущее количество: {len(BotConfig.MODERATORS)}",
@@ -858,12 +873,12 @@ class MemesModerationBot:
         )
         await callback.answer()
     
-    async def _admin_admins(self, callback: CallbackQuery):
-        """Управление администраторами"""
+    async def _admin_admins(self, callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id not in BotConfig.ADMIN_IDS:
             await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
+        await state.clear()
         await callback.message.edit_text(
             "🛠️ <b>Управление администраторами</b>\n\n"
             f"Текущее количество: {len(BotConfig.ADMIN_IDS)}",
@@ -872,12 +887,12 @@ class MemesModerationBot:
         )
         await callback.answer()
     
-    async def _admin_cleanup(self, callback: CallbackQuery):
-        """Очистка очереди"""
+    async def _admin_cleanup(self, callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id not in BotConfig.ADMIN_IDS:
             await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
+        await state.clear()
         count = await self.post_manager.cleanup_all_pending()
         
         await callback.message.edit_text(
@@ -889,39 +904,41 @@ class MemesModerationBot:
         await callback.answer()
     
     async def _admin_broadcast(self, callback: CallbackQuery, state: FSMContext):
-        """Рассылка сообщений"""
         if callback.from_user.id not in BotConfig.ADMIN_IDS:
             await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
+        await state.clear()
         await state.set_state(AdminStates.waiting_broadcast)
         await callback.message.answer(
             "📢 <b>Рассылка сообщения</b>\n\n"
-            "Введите сообщение для рассылки всем пользователям, которые когда-либо отправляли предложки:",
-            parse_mode="HTML"
+            "Введите сообщение для рассылки всем пользователям, которые когда-либо отправляли предложки:\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
-    async def _admin_save(self, callback: CallbackQuery):
-        """Сохранение конфигурации"""
+    async def _admin_save(self, callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id not in BotConfig.ADMIN_IDS:
             await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
+        await state.clear()
         BotConfig.save_config()
         await callback.answer("✅ Конфигурация сохранена в файл!")
     
-    async def _admin_close(self, callback: CallbackQuery):
-        """Закрытие админ-панели"""
+    async def _admin_close(self, callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         await callback.message.delete()
         await callback.answer()
     
-    async def _admin_back(self, callback: CallbackQuery):
-        """Возврат в главное меню админ-панели"""
+    async def _admin_back(self, callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id not in BotConfig.ADMIN_IDS:
             await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
+        await state.clear()
         await callback.message.edit_text(
             "⚙️ <b>Админ-панель управления ботом</b>\n\n"
             "Выберите действие:",
@@ -932,72 +949,102 @@ class MemesModerationBot:
     
     # ================== НАСТРОЙКИ ==================
     async def _set_photo_size(self, callback: CallbackQuery, state: FSMContext):
-        """Установка максимального размера фото"""
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
+            return
+        
         await state.set_state(AdminStates.waiting_photo_size)
         await callback.message.answer(
             f"📸 <b>Текущий максимальный размер фото: {BotConfig.MAX_PHOTO_SIZE_MB} МБ</b>\n\n"
-            "Введите новый размер в МБ (1-100):",
-            parse_mode="HTML"
+            "Введите новый размер в МБ (1-100):\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
     async def _set_video_size(self, callback: CallbackQuery, state: FSMContext):
-        """Установка максимального размера видео"""
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
+            return
+        
         await state.set_state(AdminStates.waiting_video_size)
         await callback.message.answer(
             f"🎥 <b>Текущий максимальный размер видео: {BotConfig.MAX_VIDEO_SIZE_MB} МБ</b>\n\n"
-            "Введите новый размер в МБ (1-500):",
-            parse_mode="HTML"
+            "Введите новый размер в МБ (1-500):\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
     async def _set_pending_limit(self, callback: CallbackQuery, state: FSMContext):
-        """Установка максимального размера очереди"""
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
+            return
+        
         await state.set_state(AdminStates.waiting_pending_limit)
         await callback.message.answer(
             f"📁 <b>Текущий максимальный размер очереди: {BotConfig.MAX_PENDING_POSTS}</b>\n\n"
-            "Введите новый лимит (10-1000):",
-            parse_mode="HTML"
+            "Введите новый лимит (10-1000):\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
     async def _set_cleanup_interval(self, callback: CallbackQuery, state: FSMContext):
-        """Установка интервала очистки"""
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
+            return
+        
         await state.set_state(AdminStates.waiting_cleanup_interval)
         await callback.message.answer(
             f"⏰ <b>Текущий интервал очистки: {BotConfig.CLEANUP_INTERVAL_HOURS} часов</b>\n\n"
-            "Введите новый интервал в часах (1-720):",
-            parse_mode="HTML"
+            "Введите новый интервал в часах (1-720):\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
     async def _add_moderator(self, callback: CallbackQuery, state: FSMContext):
-        """Добавление модератора"""
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
+            return
+        
         await state.set_state(AdminStates.waiting_moderator_id)
         await callback.message.answer(
             "➕ <b>Добавление модератора</b>\n\n"
-            "Введите ID пользователя для добавления в модераторы:",
-            parse_mode="HTML"
+            "Введите ID пользователя для добавления в модераторы:\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
-    async def _remove_moderator(self, callback: CallbackQuery):
-        """Удаление модератора"""
-        if not BotConfig.MODERATORS:
-            await callback.answer("Список модераторов пуст!", show_alert=True)
+    async def _remove_moderator(self, callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
-        moderators_list = "\n".join([f"• <code>{mod_id}</code>" for mod_id in BotConfig.MODERATORS])
-        await callback.message.edit_text(
-            f"➖ <b>Удаление модератора</b>\n\n"
-            f"Текущие модераторы:\n{moderators_list}\n\n"
-            "Введите ID модератора для удаления:",
-            parse_mode="HTML"
+        await state.set_state(AdminStates.waiting_moderator_id)
+        await state.update_data(action="remove_moderator")
+        await callback.message.answer(
+            "➖ <b>Удаление модератора</b>\n\n"
+            "Введите ID модератора для удаления:\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
-    async def _list_moderators(self, callback: CallbackQuery):
-        """Список модераторов"""
+    async def _list_moderators(self, callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
+            return
+        
+        await state.clear()
         if not BotConfig.MODERATORS:
             await callback.answer("Список модераторов пуст!", show_alert=True)
             return
@@ -1013,32 +1060,43 @@ class MemesModerationBot:
         await callback.answer()
     
     async def _add_admin(self, callback: CallbackQuery, state: FSMContext):
-        """Добавление администратора"""
-        await state.set_state(AdminStates.waiting_admin_id)
-        await callback.message.answer(
-            "➕ <b>Добавление администратора</b>\n\n"
-            "Введите ID пользователя для добавления в администраторы:",
-            parse_mode="HTML"
-        )
-        await callback.answer()
-    
-    async def _remove_admin(self, callback: CallbackQuery):
-        """Удаление администратора"""
-        if len(BotConfig.ADMIN_IDS) <= 1:
-            await callback.answer("Нельзя удалить последнего администратора!", show_alert=True)
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
             return
         
-        admins_list = "\n".join([f"• <code>{admin_id}</code>" for admin_id in BotConfig.ADMIN_IDS])
-        await callback.message.edit_text(
-            f"➖ <b>Удаление администратора</b>\n\n"
-            f"Текущие администраторы:\n{admins_list}\n\n"
-            "Введите ID администратора для удаления:",
-            parse_mode="HTML"
+        await state.set_state(AdminStates.waiting_admin_id)
+        await state.update_data(action="add_admin")
+        await callback.message.answer(
+            "➕ <b>Добавление администратора</b>\n\n"
+            "Введите ID пользователя для добавления в администраторы:\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
         )
         await callback.answer()
     
-    async def _list_admins(self, callback: CallbackQuery):
-        """Список администраторов"""
+    async def _remove_admin(self, callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
+            return
+        
+        await state.set_state(AdminStates.waiting_admin_id)
+        await state.update_data(action="remove_admin")
+        await callback.message.answer(
+            "➖ <b>Удаление администратора</b>\n\n"
+            "Введите ID администратора для удаления:\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_cancel_kb()
+        )
+        await callback.answer()
+    
+    async def _list_admins(self, callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in BotConfig.ADMIN_IDS:
+            await callback.answer("⛔ Нет доступа!", show_alert=True)
+            return
+        
+        await state.clear()
         if not BotConfig.ADMIN_IDS:
             await callback.answer("Список администраторов пуст!", show_alert=True)
             return
@@ -1057,6 +1115,7 @@ class MemesModerationBot:
     async def _handle_admin_input(self, message: Message, state: FSMContext):
         """Обработка ввода в админ-панели"""
         current_state = await state.get_state()
+        data = await state.get_data()
         
         try:
             if current_state == AdminStates.waiting_photo_size:
@@ -1093,17 +1152,36 @@ class MemesModerationBot:
             
             elif current_state == AdminStates.waiting_moderator_id:
                 mod_id = int(message.text)
-                BotConfig.MODERATORS.add(mod_id)
-                await message.answer(f"✅ Модератор {mod_id} добавлен")
+                action = data.get('action', 'add')
+                
+                if action == "remove":
+                    if mod_id in BotConfig.MODERATORS:
+                        BotConfig.MODERATORS.remove(mod_id)
+                        await message.answer(f"✅ Модератор {mod_id} удален")
+                    else:
+                        await message.answer(f"❌ Модератор {mod_id} не найден")
+                else:
+                    BotConfig.MODERATORS.add(mod_id)
+                    await message.answer(f"✅ Модератор {mod_id} добавлен")
             
             elif current_state == AdminStates.waiting_admin_id:
                 admin_id = int(message.text)
-                BotConfig.ADMIN_IDS.add(admin_id)
-                await message.answer(f"✅ Администратор {admin_id} добавлен")
+                action = data.get('action', 'add')
+                
+                if action == "remove":
+                    if admin_id in BotConfig.ADMIN_IDS:
+                        if len(BotConfig.ADMIN_IDS) > 1:
+                            BotConfig.ADMIN_IDS.remove(admin_id)
+                            await message.answer(f"✅ Администратор {admin_id} удален")
+                        else:
+                            await message.answer("❌ Нельзя удалить последнего администратора!")
+                    else:
+                        await message.answer(f"❌ Администратор {admin_id} не найден")
+                else:
+                    BotConfig.ADMIN_IDS.add(admin_id)
+                    await message.answer(f"✅ Администратор {admin_id} добавлен")
             
             elif current_state == AdminStates.waiting_broadcast:
-                # Здесь нужно реализовать рассылку
-                # Для простоты просто подтвердим
                 await message.answer("✅ Сообщение принято для рассылки. (Функция в разработке)")
             
             else:
@@ -1112,11 +1190,17 @@ class MemesModerationBot:
         except ValueError:
             await message.answer("❌ Пожалуйста, введите число")
         
+        # Возвращаем в админ-панель
         await state.clear()
+        await message.answer(
+            "⚙️ <b>Админ-панель управления ботом</b>\n\n"
+            "Выберите действие:",
+            parse_mode="HTML",
+            reply_markup=KeyboardFactory.get_admin_panel_kb()
+        )
     
     # ================== ВСПОМОГАТЕЛЬНЫЕ КОЛБЭКИ ==================
     async def _show_rules(self, callback: CallbackQuery):
-        """Показывает правила"""
         await callback.message.answer(
             "📜 <b>Правила предложки:</b>\n\n"
             "1. Только оригинальный контент\n"
@@ -1129,7 +1213,6 @@ class MemesModerationBot:
         await callback.answer()
     
     async def _how_to_send(self, callback: CallbackQuery):
-        """Инструкция по отправке"""
         await callback.message.answer(
             "📤 <b>Как отправить предложку:</b>\n\n"
             "1. Просто пришли фото или видео в этот чат\n"
@@ -1142,7 +1225,6 @@ class MemesModerationBot:
     
     # ================== ЗАПУСК ==================
     async def run(self):
-        """Запуск бота"""
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -1152,7 +1234,6 @@ class MemesModerationBot:
             ]
         )
         
-        # Проверка конфигурации
         self._validate_config()
         
         print("=" * 50)
@@ -1167,9 +1248,9 @@ class MemesModerationBot:
         print("✅ 4 кнопки модерации: одобрить/отклонить с комментариями")
         print("✅ Чистые публикации в группе")
         print("✅ Админ-панель с настройками")
+        print("✅ FSM состояния работают корректно")
         print("=" * 50)
         
-        # Запуск polling
         await self.dp.start_polling(
             self.bot,
             allowed_updates=self.dp.resolve_used_update_types(),
@@ -1177,7 +1258,6 @@ class MemesModerationBot:
         )
     
     def _validate_config(self):
-        """Базовая валидация конфигурации"""
         required = ['BOT_TOKEN', 'MODERATORS_CHAT_ID', 'MAIN_GROUP_ID', 'MODERATORS', 'ADMIN_IDS']
         for attr in required:
             if not getattr(BotConfig, attr, None):
@@ -1188,9 +1268,7 @@ class MemesModerationBot:
         
         print("✓ Конфигурация валидна")
 
-# ================== ТОЧКА ВХОДА ==================
 def main():
-    """Точка входа в приложение"""
     bot = MemesModerationBot()
     
     try:
